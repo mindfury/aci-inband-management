@@ -1,0 +1,35 @@
+{
+  "apic_version": "5.2",
+  "tenant": "mgmt",
+  "management_profile": "default",
+  "vrf": "inb",
+  "bridge_domain": "inb",
+  "subnet_gateway": "192.0.2.1/24",
+  "subnet_scope": "private",
+  "l3outs": [],
+  "epg": "inb",
+  "vlan": 3999,
+  "provided_contracts": [],
+  "consumed_contracts": [],
+  "nodes": [
+    {"pod_id": 1, "node_id": 1, "address": "192.0.2.11/24"},
+    {"pod_id": 1, "node_id": 101, "address": "192.0.2.101/24"},
+    {"pod_id": 1, "node_id": 201, "address": "192.0.2.201/24"}
+  ],
+  "access_policy": {
+    "vlan_pool": "inband-mgmt",
+    "physical_domain": "inband-mgmt",
+    "aaep": "inband-mgmt",
+    "port_policy_group": "inband-mgmt",
+    "interfaces": [
+      {
+        "interface_profile": "leaf101-ifprof",
+        "selector": "apic1-inband",
+        "block": "eth1-48",
+        "card": 1,
+        "port": 48
+      }
+    ]
+  }
+}
+
