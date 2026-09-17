@@ -1,4 +1,10 @@
-"""Configuration loading and validation independent of the Cobra SDK."""
+"""Load operator-friendly JSON and reject dangerous input before APIC login.
+
+This module deliberately contains no Cobra imports.  A GUI/Postman user can
+think of it as the validation normally performed by APIC form fields: it checks
+VLAN bounds, address syntax, duplicate nodes, subnet membership, and required
+names before the program is allowed to establish an APIC session.
+"""
 
 from __future__ import annotations
 
@@ -15,8 +21,14 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class NodeAddress:
+    """One row from GUI > Static Node Management Addresses."""
+
+    # ACI node identity.  pod 1 / node 101 becomes the target DN
+    # topology/pod-1/node-101 used by mgmtRsInBStNode.
     pod_id: int
     node_id: int
+
+    # ``address`` includes the prefix; ``gateway`` is a host address only.
     address: str
     gateway: str
 
@@ -27,15 +39,22 @@ class NodeAddress:
 
 @dataclass(frozen=True)
 class AccessInterface:
+    """One APIC-facing leaf port selector under an existing interface profile."""
+
+    # The profile must already be associated with the correct leaf switch.
     interface_profile: str
+    # ACI names the selector and its port block independently.
     selector: str
     block: str
+    # A normal fixed leaf port is card/module 1 and a positive port number.
     card: int
     port: int
 
 
 @dataclass(frozen=True)
 class AccessPolicy:
+    """Names used by the optional Fabric > Access Policies configuration."""
+
     vlan_pool: str
     physical_domain: str
     aaep: str
@@ -45,6 +64,12 @@ class AccessPolicy:
 
 @dataclass(frozen=True)
 class InbandConfig:
+    """Validated desired state consumed by the Cobra object builder.
+
+    ``frozen=True`` prevents accidental mutation after validation.  If a value
+    needs to change, edit the JSON and load/validate it again.
+    """
+
     apic_version: str
     tenant: str
     management_profile: str
@@ -66,12 +91,19 @@ class InbandConfig:
 
 
 def _required(data: dict[str, Any], key: str) -> Any:
+    """Return a required JSON member or raise a readable operator error."""
     if key not in data or data[key] in (None, ""):
         raise ConfigError(f"missing required field: {key}")
     return data[key]
 
 
 def _name(value: Any, field: str) -> str:
+    """Apply the conservative naming rule used by this utility.
+
+    APIC naming rules vary slightly by class.  Restricting these inputs to
+    non-empty, whitespace-free names of at most 64 characters avoids producing
+    ambiguous DNs and catches the most common copy/paste mistakes.
+    """
     value = str(value)
     if not value or len(value) > 64 or any(ch.isspace() for ch in value):
         raise ConfigError(f"{field} must be a non-empty ACI name without whitespace (max 64)")
@@ -79,24 +111,37 @@ def _name(value: Any, field: str) -> str:
 
 
 def load_config(path: str | Path) -> InbandConfig:
+    """Read JSON, validate every field, and return typed configuration."""
+
+    # json.loads converts the text into ordinary Python dictionaries/lists.
+    # Nothing in this step contacts APIC or changes the fabric.
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ConfigError("configuration root must be a JSON object")
 
+    # This repo intentionally targets the 5.2 model.  The CLI separately checks
+    # the version reported by aaaLogin so an operator cannot accidentally point
+    # it at a 6.x fabric merely by supplying a different URL.
     version = str(raw.get("apic_version", "5.2"))
     if not version.startswith("5.2"):
         raise ConfigError("this release is validated for APIC 5.2; set apic_version to 5.2")
 
+    # ACI reserves VLAN 0 and 4095.  int() also accepts a JSON string such as
+    # "3999", which is convenient when translating values from a worksheet.
     vlan = int(_required(raw, "vlan"))
     if not 1 <= vlan <= 4094:
         raise ConfigError("vlan must be between 1 and 4094")
 
+    # ip_interface understands an address plus prefix, e.g. 192.0.2.1/24.
+    # It gives us both the gateway host address and its containing network.
     subnet_gateway = str(_required(raw, "subnet_gateway"))
     try:
         subnet = ipaddress.ip_interface(subnet_gateway)
     except ValueError as exc:
         raise ConfigError(f"invalid subnet_gateway: {exc}") from exc
 
+    # Build a clean list while tracking uniqueness.  APIC may report conflicts
+    # later, but catching them here makes the failure obvious before any POST.
     nodes: list[NodeAddress] = []
     seen_targets: set[tuple[int, int]] = set()
     seen_ips: set[str] = set()
@@ -105,6 +150,7 @@ def load_config(path: str | Path) -> InbandConfig:
             pod_id = int(item.get("pod_id", 1))
             node_id = int(item["node_id"])
             address = str(item["address"])
+            # When a node omits gateway, use the host portion of subnet_gateway.
             gateway = str(item.get("gateway", subnet.ip))
             node_if = ipaddress.ip_interface(address)
             gateway_ip = ipaddress.ip_address(gateway)
@@ -112,6 +158,8 @@ def load_config(path: str | Path) -> InbandConfig:
             raise ConfigError(f"invalid nodes[{index}]: {exc}") from exc
         if node_if.version != subnet.version or gateway_ip.version != subnet.version:
             raise ConfigError(f"nodes[{index}] address family does not match subnet_gateway")
+        # Every node address and gateway must belong to the BD subnet.  This
+        # catches a wrong prefix or a pasted address from another management LAN.
         if node_if.network != subnet.network or gateway_ip not in subnet.network:
             raise ConfigError(f"nodes[{index}] address/gateway must be in {subnet.network}")
         target = (pod_id, node_id)
@@ -128,6 +176,8 @@ def load_config(path: str | Path) -> InbandConfig:
     if not nodes:
         raise ConfigError("nodes must contain at least one APIC, leaf, or spine")
 
+    # In the GUI, "Advertised Externally" corresponds to public scope.  Private
+    # is the safe default when no L3Out advertisement is requested.
     scope = str(raw.get("subnet_scope", "private"))
     valid_scopes = {"private", "public", "shared", "public,shared"}
     if scope not in valid_scopes:
@@ -137,6 +187,8 @@ def load_config(path: str | Path) -> InbandConfig:
     if l3outs and "public" not in scope.split(","):
         raise ConfigError("subnet_scope must include public when l3outs are configured")
 
+    # access_policy is optional.  Omitting it means "the required VLAN/domain/
+    # AAEP/leaf-port plumbing already exists; configure only the mgmt tenant."
     access = raw.get("access_policy")
     access_policy = None
     if access is not None:
@@ -164,6 +216,8 @@ def load_config(path: str | Path) -> InbandConfig:
             interfaces=interfaces,
         )
 
+    # Convert mutable JSON lists into immutable tuples and apply defaults for
+    # standard ACI names.  The rest of the program never reads raw JSON again.
     return InbandConfig(
         apic_version=version,
         tenant=_name(raw.get("tenant", "mgmt"), "tenant"),
@@ -187,7 +241,11 @@ def load_config(path: str | Path) -> InbandConfig:
 
 
 def plan(config: InbandConfig) -> dict[str, Any]:
-    """Return a reviewable, credential-free plan."""
+    """Return a reviewable, credential-free description of intended DNs.
+
+    This is what ``--plan`` prints.  It intentionally requires neither an APIC
+    password nor Cobra, so it can be attached to a change record for review.
+    """
     result: dict[str, Any] = {
         "target": "Cisco APIC 5.2",
         "management_tenant": config.tenant,
@@ -217,4 +275,3 @@ def plan(config: InbandConfig) -> dict[str, Any]:
             "interfaces": [i.__dict__ for i in config.access_policy.interfaces],
         }
     return result
-

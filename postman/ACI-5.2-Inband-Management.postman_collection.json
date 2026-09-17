@@ -1,0 +1,296 @@
+{
+  "info": {
+    "_postman_id": "cd31f934-f696-4d7f-9c3a-acde52ba0d01",
+    "name": "Cisco ACI 5.2 - In-Band Management",
+    "description": "Creates the same ACI objects as the Cobra implementation. Run requests in order. Every request description maps the REST object to its APIC GUI location. Start with configure_access_policy=false unless the APIC-facing leaf ports still need the VLAN/domain/AAEP/policy-group configuration. Keep OOB management available throughout the change.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "event": [
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// APIC often returns HTTP 200 even when the JSON body contains an error object.",
+          "// Therefore every request checks both the HTTP status and the APIC imdata payload.",
+          "pm.test('HTTP status is 200', function () {",
+          "    pm.response.to.have.status(200);",
+          "});",
+          "",
+          "let responseBody;",
+          "try { responseBody = pm.response.json(); } catch (e) { responseBody = null; }",
+          "pm.test('APIC did not return an error object', function () {",
+          "    const first = responseBody && responseBody.imdata && responseBody.imdata[0];",
+          "    if (first && first.error) {",
+          "        throw new Error('APIC error ' + first.error.attributes.code + ': ' + first.error.attributes.text);",
+          "    }",
+          "});"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "1 - Authenticate",
+      "description": "Equivalent to logging into the APIC GUI. The test script saves the returned token as apic_token; subsequent requests send it as the APIC-cookie.",
+      "item": [
+        {
+          "name": "Login to APIC",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "const login = body.imdata && body.imdata[0] && body.imdata[0].aaaLogin;",
+                  "pm.test('Login token was returned', function () { pm.expect(login).to.exist; });",
+                  "if (login) {",
+                  "    pm.environment.set('apic_token', login.attributes.token);",
+                  "    pm.environment.set('reported_apic_version', login.attributes.version);",
+                  "    console.log('APIC version:', login.attributes.version);",
+                  "    if (!String(login.attributes.version).startsWith('5.2')) {",
+                  "        throw new Error('This collection targets APIC 5.2; controller reported ' + login.attributes.version);",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"aaaUser\": {\n    \"attributes\": {\n      \"name\": \"{{username}}\",\n      \"pwd\": \"{{password}}\"\n    }\n  }\n}"
+            },
+            "url": {"raw": "{{apic}}/api/aaaLogin.json", "host": ["{{apic}}"], "path": ["api", "aaaLogin.json"]},
+            "description": "REST class: aaaUser. Enter password as a secret value in the imported environment; do not save a production password in the collection."
+          }
+        }
+      ]
+    },
+    {
+      "name": "2 - Management tenant",
+      "description": "Creates the VRF, BD, subnet, optional L3Out relationships, mgmtInB EPG, contract relationships, and static node addresses under the mgmt tenant.",
+      "item": [
+        {
+          "name": "Preview generated management payload",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const parseArray = (name) => {",
+                  "    const raw = pm.environment.get(name) || '[]';",
+                  "    const value = JSON.parse(raw);",
+                  "    if (!Array.isArray(value)) throw new Error(name + ' must be a JSON array');",
+                  "    return value;",
+                  "};",
+                  "const nodes = parseArray('nodes_json');",
+                  "const l3outs = parseArray('l3outs_json');",
+                  "const providers = parseArray('provided_contracts_json');",
+                  "const consumers = parseArray('consumed_contracts_json');",
+                  "const bdChildren = [",
+                  "    { fvRsCtx: { attributes: { tnFvCtxName: pm.environment.get('vrf') } } },",
+                  "    { fvSubnet: { attributes: { ip: pm.environment.get('subnet_gateway'), scope: pm.environment.get('subnet_scope') } } },",
+                  "    ...l3outs.map(name => ({ fvRsBDToOut: { attributes: { tnL3extOutName: name } } }))",
+                  "];",
+                  "const inbandChildren = [",
+                  "    { mgmtRsMgmtBD: { attributes: { tnFvBDName: pm.environment.get('bridge_domain') } } },",
+                  "    ...providers.map(name => ({ vzRsProv: { attributes: { tnVzBrCPName: name } } })),",
+                  "    ...consumers.map(name => ({ vzRsCons: { attributes: { tnVzBrCPName: name } } })),",
+                  "    ...nodes.map(node => ({ mgmtRsInBStNode: { attributes: {",
+                  "        tDn: 'topology/pod-' + (node.pod_id || 1) + '/node-' + node.node_id,",
+                  "        addr: node.address,",
+                  "        gw: node.gateway || String(pm.environment.get('subnet_gateway')).split('/')[0]",
+                  "    } } }))",
+                  "];",
+                  "const payload = { fvTenant: { attributes: { name: pm.environment.get('tenant') }, children: [",
+                  "    { fvCtx: { attributes: { name: pm.environment.get('vrf') } } },",
+                  "    { fvBD: { attributes: { name: pm.environment.get('bridge_domain') }, children: bdChildren } },",
+                  "    { mgmtMgmtP: { attributes: { name: pm.environment.get('management_profile') }, children: [",
+                  "        { mgmtInB: { attributes: { name: pm.environment.get('epg'), encap: 'vlan-' + pm.environment.get('vlan') }, children: inbandChildren } }",
+                  "    ] } }",
+                  "] } };",
+                  "pm.variables.set('mgmt_payload', JSON.stringify(payload, null, 2));",
+                  "console.log(pm.variables.get('mgmt_payload'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {"key": "Cookie", "value": "APIC-cookie={{apic_token}}"}
+            ],
+            "url": {"raw": "{{apic}}/api/mo/uni/tn-{{tenant}}.json?rsp-subtree=full", "host": ["{{apic}}"], "path": ["api", "mo", "uni", "tn-{{tenant}}.json"], "query": [{"key": "rsp-subtree", "value": "full"}]},
+            "description": "This is a read-only GET. Open Postman Console to inspect the generated body. The next request generates and applies the identical payload."
+          }
+        },
+        {
+          "name": "Create or update in-band management objects",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const parseArray = (name) => { const value = JSON.parse(pm.environment.get(name) || '[]'); if (!Array.isArray(value)) throw new Error(name + ' must be a JSON array'); return value; };",
+                  "const nodes = parseArray('nodes_json');",
+                  "if (!nodes.length) throw new Error('nodes_json must contain at least one node');",
+                  "const bdChildren = [",
+                  "  {fvRsCtx:{attributes:{tnFvCtxName:pm.environment.get('vrf')}}},",
+                  "  {fvSubnet:{attributes:{ip:pm.environment.get('subnet_gateway'),scope:pm.environment.get('subnet_scope')}}},",
+                  "  ...parseArray('l3outs_json').map(name=>({fvRsBDToOut:{attributes:{tnL3extOutName:name}}}))",
+                  "];",
+                  "const gwDefault = String(pm.environment.get('subnet_gateway')).split('/')[0];",
+                  "const inbandChildren = [",
+                  "  {mgmtRsMgmtBD:{attributes:{tnFvBDName:pm.environment.get('bridge_domain')}}},",
+                  "  ...parseArray('provided_contracts_json').map(name=>({vzRsProv:{attributes:{tnVzBrCPName:name}}})),",
+                  "  ...parseArray('consumed_contracts_json').map(name=>({vzRsCons:{attributes:{tnVzBrCPName:name}}})),",
+                  "  ...nodes.map(node=>({mgmtRsInBStNode:{attributes:{tDn:'topology/pod-'+(node.pod_id||1)+'/node-'+node.node_id,addr:node.address,gw:node.gateway||gwDefault}}}))",
+                  "];",
+                  "const payload={fvTenant:{attributes:{name:pm.environment.get('tenant')},children:[",
+                  "  {fvCtx:{attributes:{name:pm.environment.get('vrf')}}},",
+                  "  {fvBD:{attributes:{name:pm.environment.get('bridge_domain')},children:bdChildren}},",
+                  "  {mgmtMgmtP:{attributes:{name:pm.environment.get('management_profile')},children:[{mgmtInB:{attributes:{name:pm.environment.get('epg'),encap:'vlan-'+pm.environment.get('vlan')},children:inbandChildren}}]}}",
+                  "]}};",
+                  "pm.variables.set('mgmt_payload',JSON.stringify(payload));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"},
+              {"key": "Cookie", "value": "APIC-cookie={{apic_token}}"}
+            ],
+            "body": {"mode": "raw", "raw": "{{mgmt_payload}}"},
+            "url": {"raw": "{{apic}}/api/mo/uni/tn-{{tenant}}.json", "host": ["{{apic}}"], "path": ["api", "mo", "uni", "tn-{{tenant}}.json"]},
+            "description": "GUI mapping: Tenants > mgmt > Networking and Node Management EPGs/Addresses. APIC merges the children at their DNs; this is not a replace-all operation. Review the generated body in Postman Console before the first production run."
+          }
+        }
+      ]
+    },
+    {
+      "name": "3 - Optional access policy",
+      "description": "These requests are automatically skipped unless configure_access_policy is exactly true. They configure the VLAN plumbing on APIC-facing leaf ports. Existing leaf interface profiles must already be mapped to the correct leaf switch profiles.",
+      "item": [
+        {
+          "name": "Create static VLAN pool and block",
+          "event": [{"listen": "prerequest", "script": {"type": "text/javascript", "exec": ["if (pm.environment.get('configure_access_policy') !== 'true') pm.execution.skipRequest();"]}}],
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "Cookie", "value": "APIC-cookie={{apic_token}}"}],
+            "body": {"mode": "raw", "raw": "{\n  \"fvnsVlanInstP\": {\n    \"attributes\": {\"name\": \"{{vlan_pool}}\", \"allocMode\": \"static\"},\n    \"children\": [\n      {\"fvnsEncapBlk\": {\"attributes\": {\"from\": \"vlan-{{vlan}}\", \"to\": \"vlan-{{vlan}}\", \"allocMode\": \"static\"}}}\n    ]\n  }\n}"},
+            "url": {"raw": "{{apic}}/api/mo/uni/infra/vlanns-[{{vlan_pool}}]-static.json", "host": ["{{apic}}"], "path": ["api", "mo", "uni", "infra", "vlanns-[{{vlan_pool}}]-static.json"]},
+            "description": "GUI: Fabric > Access Policies > Pools > VLAN. Classes: fvnsVlanInstP and fvnsEncapBlk."
+          }
+        },
+        {
+          "name": "Create physical domain and bind VLAN pool",
+          "event": [{"listen": "prerequest", "script": {"type": "text/javascript", "exec": ["if (pm.environment.get('configure_access_policy') !== 'true') pm.execution.skipRequest();"]}}],
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "Cookie", "value": "APIC-cookie={{apic_token}}"}],
+            "body": {"mode": "raw", "raw": "{\n  \"physDomP\": {\n    \"attributes\": {\"name\": \"{{physical_domain}}\"},\n    \"children\": [\n      {\"infraRsVlanNs\": {\"attributes\": {\"tDn\": \"uni/infra/vlanns-[{{vlan_pool}}]-static\"}}}\n    ]\n  }\n}"},
+            "url": {"raw": "{{apic}}/api/mo/uni/phys-{{physical_domain}}.json", "host": ["{{apic}}"], "path": ["api", "mo", "uni", "phys-{{physical_domain}}.json"]},
+            "description": "GUI: Fabric > Access Policies > Physical and External Domains > Physical Domains. Classes: physDomP and infraRsVlanNs."
+          }
+        },
+        {
+          "name": "Create AAEP and bind physical domain",
+          "event": [{"listen": "prerequest", "script": {"type": "text/javascript", "exec": ["if (pm.environment.get('configure_access_policy') !== 'true') pm.execution.skipRequest();"]}}],
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "Cookie", "value": "APIC-cookie={{apic_token}}"}],
+            "body": {"mode": "raw", "raw": "{\n  \"infraAttEntityP\": {\n    \"attributes\": {\"name\": \"{{aaep}}\"},\n    \"children\": [\n      {\"infraRsDomP\": {\"attributes\": {\"tDn\": \"uni/phys-{{physical_domain}}\"}}}\n    ]\n  }\n}"},
+            "url": {"raw": "{{apic}}/api/mo/uni/infra/attentp-{{aaep}}.json", "host": ["{{apic}}"], "path": ["api", "mo", "uni", "infra", "attentp-{{aaep}}.json"]},
+            "description": "GUI: Fabric > Access Policies > Policies > Global > Attachable Access Entity Profiles. Classes: infraAttEntityP and infraRsDomP."
+          }
+        },
+        {
+          "name": "Create leaf access port policy group",
+          "event": [{"listen": "prerequest", "script": {"type": "text/javascript", "exec": ["if (pm.environment.get('configure_access_policy') !== 'true') pm.execution.skipRequest();"]}}],
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "Cookie", "value": "APIC-cookie={{apic_token}}"}],
+            "body": {"mode": "raw", "raw": "{\n  \"infraAccPortGrp\": {\n    \"attributes\": {\"name\": \"{{port_policy_group}}\"},\n    \"children\": [\n      {\"infraRsAttEntP\": {\"attributes\": {\"tDn\": \"uni/infra/attentp-{{aaep}}\"}}}\n    ]\n  }\n}"},
+            "url": {"raw": "{{apic}}/api/mo/uni/infra/funcprof/accportgrp-{{port_policy_group}}.json", "host": ["{{apic}}"], "path": ["api", "mo", "uni", "infra", "funcprof", "accportgrp-{{port_policy_group}}.json"]},
+            "description": "GUI: Fabric > Access Policies > Interface Policies > Policy Groups > Leaf Access Port. Notice the funcprof parent in the DN. Classes: infraAccPortGrp and infraRsAttEntP."
+          }
+        },
+        {
+          "name": "Verify referenced leaf interface profiles exist",
+          "event": [
+            {"listen": "prerequest", "script": {"type": "text/javascript", "exec": ["if (pm.environment.get('configure_access_policy') !== 'true') pm.execution.skipRequest();"]}},
+            {"listen": "test", "script": {"type": "text/javascript", "exec": [
+              "const wanted=[...new Set(JSON.parse(pm.environment.get('access_interfaces_json')||'[]').map(x=>x.interface_profile))];",
+              "const found=pm.response.json().imdata.map(x=>x.infraAccPortP&&x.infraAccPortP.attributes.name).filter(Boolean);",
+              "const missing=wanted.filter(name=>!found.includes(name));",
+              "pm.test('All configured interface profiles already exist',function(){pm.expect(missing,'Missing: '+missing.join(', ')).to.be.empty;});",
+              "if(missing.length) pm.execution.setNextRequest(null);"
+            ]}}
+          ],
+          "request": {
+            "method": "GET",
+            "header": [{"key": "Cookie", "value": "APIC-cookie={{apic_token}}"}],
+            "url": {"raw": "{{apic}}/api/node/class/infraAccPortP.json", "host": ["{{apic}}"], "path": ["api", "node", "class", "infraAccPortP.json"]},
+            "description": "Safety gate corresponding to the Cobra preflight lookup. It prevents this collection run from silently inventing an interface profile that is not mapped to a leaf."
+          }
+        },
+        {
+          "name": "Add selectors to existing leaf interface profiles",
+          "event": [{"listen": "prerequest", "script": {"type": "text/javascript", "exec": [
+            "if(pm.environment.get('configure_access_policy')!=='true'){pm.execution.skipRequest();return;}",
+            "const entries=JSON.parse(pm.environment.get('access_interfaces_json')||'[]');",
+            "const profiles={};",
+            "entries.forEach(i=>{",
+            "  if(!profiles[i.interface_profile]) profiles[i.interface_profile]=[];",
+            "  profiles[i.interface_profile].push({infraHPortS:{attributes:{name:i.selector,type:'range'},children:[",
+            "    {infraPortBlk:{attributes:{name:i.block||('block-'+i.card+'-'+i.port),fromCard:String(i.card),toCard:String(i.card),fromPort:String(i.port),toPort:String(i.port)}}},",
+            "    {infraRsAccBaseGrp:{attributes:{tDn:'uni/infra/funcprof/accportgrp-'+pm.environment.get('port_policy_group')}}}",
+            "  ]}});",
+            "});",
+            "const children=Object.entries(profiles).map(([name,selectors])=>({infraAccPortP:{attributes:{name:name},children:selectors}}));",
+            "pm.variables.set('selector_payload',JSON.stringify({infraInfra:{attributes:{},children:children}}));"
+          ]}}],
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "Cookie", "value": "APIC-cookie={{apic_token}}"}],
+            "body": {"mode": "raw", "raw": "{{selector_payload}}"},
+            "url": {"raw": "{{apic}}/api/mo/uni/infra.json", "host": ["{{apic}}"], "path": ["api", "mo", "uni", "infra.json"]},
+            "description": "GUI: Fabric > Access Policies > Interfaces > Leaf Interfaces > Profiles > Interface Selectors. The pre-request script groups the JSON input by existing interface profile and builds infraHPortS/infraPortBlk/infraRsAccBaseGrp children."
+          }
+        }
+      ]
+    },
+    {
+      "name": "4 - Verify",
+      "description": "Read the committed objects back from APIC. This verifies configuration state, not end-to-end reachability.",
+      "item": [
+        {
+          "name": "Read in-band EPG and all children",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "Cookie", "value": "APIC-cookie={{apic_token}}"}],
+            "url": {"raw": "{{apic}}/api/mo/uni/tn-{{tenant}}/mgmtp-{{management_profile}}/inb-{{epg}}.json?rsp-subtree=full", "host": ["{{apic}}"], "path": ["api", "mo", "uni", "tn-{{tenant}}", "mgmtp-{{management_profile}}", "inb-{{epg}}.json"], "query": [{"key": "rsp-subtree", "value": "full"}]},
+            "description": "Confirm mgmtInB, mgmtRsMgmtBD, contract relationships, and every mgmtRsInBStNode returned by APIC."
+          }
+        },
+        {
+          "name": "Read in-band bridge domain and all children",
+          "request": {
+            "method": "GET",
+            "header": [{"key": "Cookie", "value": "APIC-cookie={{apic_token}}"}],
+            "url": {"raw": "{{apic}}/api/mo/uni/tn-{{tenant}}/BD-{{bridge_domain}}.json?rsp-subtree=full", "host": ["{{apic}}"], "path": ["api", "mo", "uni", "tn-{{tenant}}", "BD-{{bridge_domain}}.json"], "query": [{"key": "rsp-subtree", "value": "full"}]},
+            "description": "Confirm fvBD, fvRsCtx, fvSubnet, and any fvRsBDToOut relationships."
+          }
+        }
+      ]
+    }
+  ]
+}

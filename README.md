@@ -7,6 +7,14 @@ The tool builds the management-tenant BD, subnet, VRF, `mgmtInB` EPG, and static
 node addresses. It can also build the VLAN pool/domain/AAEP/access-port policy
 and bind it to selectors under existing leaf interface profiles.
 
+Two equivalent implementations are included:
+
+- A heavily annotated Python/Cobra CLI in `src/aci_inband`.
+- An importable Postman collection and example environment in `postman/`.
+
+The inline Python comments explicitly map Cobra constructors to APIC GUI paths,
+REST classes, attributes, relationships, and distinguished names.
+
 ## Safety model
 
 - TLS verification is on by default.
@@ -22,6 +30,8 @@ and bind it to selectors under existing leaf interface profiles.
 Use a virtual environment and retrieve the exact Cobra packages from the target
 physical APIC. Cisco distributes Cobra as two matching wheels: `acicobra` (SDK)
 and `acimodel` (the APIC object model).
+
+The utility itself requires Python 3.10 or newer.
 
 ```bash
 python3 -m venv .venv
@@ -65,6 +75,21 @@ aci-inband --config config.json --plan
 aci-inband --config config.json --confirm
 unset ACI_PASSWORD
 ```
+
+## Postman
+
+Import these two files into Postman:
+
+- `postman/ACI-5.2-Inband-Management.postman_collection.json`
+- `postman/ACI-5.2-Inband-Management.postman_environment.json`
+
+Select the imported environment, replace every example value, and follow the
+requests in numeric order. The access-policy folder is skipped unless
+`configure_access_policy` is explicitly changed from `false` to `true`.
+
+The collection dynamically builds the node-address, contract, L3Out, and
+interface-selector children from JSON-array environment variables. See
+[`postman/README.md`](postman/README.md) for the safe run sequence.
 
 Post-change validation should include:
 
